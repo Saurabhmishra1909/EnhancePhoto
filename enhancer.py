@@ -35,7 +35,7 @@ def download_model():
 @st.cache_resource
 def load_model():
     model_path = download_model()
-    model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32)
+    model = RRDBNet(in_nc=3, out_nc=3, nf=32, nb=10, gc=16)
     model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=True)
     model.eval()
     return model
