@@ -146,7 +146,7 @@ if uploaded_file:
     
     with col1:
         st.subheader("Original Image")
-        st.image(image, use_column_width=True)
+        st.image(image, use_container_width=True)
 
     # Enhancement options
     st.sidebar.subheader("Enhancement Settings")
@@ -163,7 +163,7 @@ if uploaded_file:
         with col2:
             st.subheader("Enhanced Image")
             enhanced_image = enhance_image(image, contrast, sharpness, brightness, super_res)
-            st.image(enhanced_image, use_column_width=True)
+            st.image(enhanced_image, use_container_width=True)
             
             # Download button
             img_byte_arr = pil_to_bytes(enhanced_image)
