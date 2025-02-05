@@ -8,50 +8,47 @@ from PIL import Image, ImageEnhance
 import cv2
 import numpy as np
 import io
-import sys
 import os
-
-# Add current directory to Python path
-sys.path.append(os.path.dirname(__file__))
-
-# Import RRDBNet from architecture file
-from RRDBNet_arch import RRDBNet
 
 # Set page config (must be the first Streamlit command)
 st.set_page_config(page_title="AI Photo Enhancer", layout="wide")
 
-# Prevent Streamlit file watcher error with PyTorch
-if 'torch.classes' in sys.modules:
-    del sys.modules['torch.classes']
+# Import RRDBNet architecture
+from RRDBNet_arch import RRDBNet
 
-# Google Drive model download function
-def download_model_from_drive():
-    file_id = "1M_4u0EEq1ZUeHhrudY8P_P_08F8utv5f"  # Replace with your actual Google Drive file ID
-    destination = "models/RRDB_ESRGAN_x4.pth"
-    if not os.path.exists(destination):  # Check if model already exists
-        url = f"https://drive.google.com/uc?id={file_id}"
-        gdown.download(url, destination, quiet=False)
+# Ensure model directory exists
+os.makedirs("models", exist_ok=True)
 
-# Download model if not exists
-download_model_from_drive()
+# Google Drive model link
+MODEL_URL = "https://drive.google.com/uc?id=1M_4u0EEq1ZUeHhrudY8P_P_08F8utv5f"  # Modify with correct ID
 
-# Load ESRGAN model with caching
+# Function to download model
+@st.cache_resource
+def download_model():
+    model_path = "models/RRDB_ESRGAN_x4.pth"
+    if not os.path.exists(model_path):
+        st.info("Downloading ESRGAN model...")
+        gdown.download(MODEL_URL, model_path, quiet=False)
+    return model_path
+
+# Function to load ESRGAN model
 @st.cache_resource
 def load_model():
-    model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32)  # Match ESRGAN architecture
-    model.load_state_dict(torch.load('models/RRDB_ESRGAN_x4.pth', map_location='cpu'), strict=True)
+    model_path = download_model()
+    model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32)
+    model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=True)
     model.eval()
     return model
 
-# Initialize model
+# Load model
 try:
     model = load_model()
 except Exception as e:
     st.error(f"Error loading the model: {e}")
-    st.warning("Running without super-resolution capability.")
+    st.warning("Super-resolution disabled.")
     model = None
 
-# Utility functions
+# Function to check image size
 def check_image_size(image):
     """Check if image is too large to process"""
     width, height = image.size
@@ -60,6 +57,7 @@ def check_image_size(image):
         return False
     return True
 
+# Function to enhance image
 def enhance_image(image, contrast=1.5, sharpness=2.0, brightness=1.2, super_res=False):
     """Enhance image using contrast, sharpness, and optionally super-resolution"""
     progress_bar = st.progress(0)
@@ -94,36 +92,33 @@ def enhance_image(image, contrast=1.5, sharpness=2.0, brightness=1.2, super_res=
     status_text.text("Enhancement complete!")
     return enhanced_img
 
-def apply_super_resolution(image):
-    """Apply AI Super-Resolution using ESRGAN"""
-    try:
-        # Preprocess (keep 0-255 range)
-        img_tensor = torch.from_numpy(np.array(image).transpose((2, 0, 1))).float().unsqueeze(0)
-        
-        # Pad to multiple of 32
-        h, w = img_tensor.shape[2], img_tensor.shape[3]
-        pad_h = (32 - h % 32) % 32
-        pad_w = (32 - w % 32) % 32
-        if pad_h > 0 or pad_w > 0:
-            img_tensor = F.pad(img_tensor, (0, pad_w, 0, pad_h), mode='reflect')
+# Function to apply AI Super-Resolution
+def apply_super_resolution(image, tile_size=256):
+    """Apply AI Super-Resolution using Tiling to Prevent Crashes"""
+    img = np.array(image.convert("RGB")) / 255.0  # Normalize
+    h, w, _ = img.shape
 
-        # Process
-        with torch.no_grad():
-            output = model(img_tensor)
-        
-        # Remove padding
-        if pad_h > 0 or pad_w > 0:
-            output = output[:, :, :h*4, :w*4]
-        
-        # Post-process
-        output_image = output.squeeze().cpu().numpy().transpose((1, 2, 0))
-        output_image = np.clip(output_image, 0, 255).astype(np.uint8)
-        
-        return Image.fromarray(output_image)
-    except Exception as e:
-        st.error(f"Error during super-resolution: {e}")
-        return image
+    # Create output image placeholder
+    output_img = np.zeros((h * 4, w * 4, 3), dtype=np.float32)
 
+    # Process the image tile-by-tile
+    for y in range(0, h, tile_size):
+        for x in range(0, w, tile_size):
+            tile = img[y:y+tile_size, x:x+tile_size, :]
+            tile = torch.from_numpy(tile.transpose((2, 0, 1))).float().unsqueeze(0)
+
+            # Apply the ESRGAN model
+            with torch.no_grad():
+                out_tile = model(tile).squeeze().cpu().numpy().transpose((1, 2, 0))
+
+            # Store the processed tile in the output image
+            output_img[y*4:(y+tile_size)*4, x*4:(x+tile_size)*4, :] = out_tile
+
+    # Convert back to an image
+    output_img = np.clip(output_img * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(output_img)
+
+# Function to convert PIL Image to bytes
 def pil_to_bytes(image):
     """Convert PIL Image to byte format"""
     img_byte_arr = io.BytesIO()
@@ -132,8 +127,9 @@ def pil_to_bytes(image):
 
 # Streamlit UI
 st.title("📸 AI-Powered Photo Enhancer")
-st.write("""Enhance your photos using advanced AI and computer vision techniques! Upload an image and adjust the enhancement settings to your liking.""")
+st.write("Enhance your photos using AI Super-Resolution and OpenCV!")
 
+# File uploader
 uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
@@ -150,7 +146,7 @@ if uploaded_file:
     
     with col1:
         st.subheader("Original Image")
-        st.image(image, use_container_width=True)
+        st.image(image, use_column_width=True)
 
     # Enhancement options
     st.sidebar.subheader("Enhancement Settings")
@@ -167,7 +163,7 @@ if uploaded_file:
         with col2:
             st.subheader("Enhanced Image")
             enhanced_image = enhance_image(image, contrast, sharpness, brightness, super_res)
-            st.image(enhanced_image, use_container_width=True)
+            st.image(enhanced_image, use_column_width=True)
             
             # Download button
             img_byte_arr = pil_to_bytes(enhanced_image)
@@ -179,5 +175,6 @@ if uploaded_file:
                 use_container_width=True
             )
 
-# Add footer
-st.markdown("""--- Made by Saurabh with ❤️ using Streamlit, PyTorch, and OpenCV""")
+# Footer
+st.markdown("---")
+st.markdown("Made with ❤️ by Saurabh using Streamlit, PyTorch, and OpenCV")
