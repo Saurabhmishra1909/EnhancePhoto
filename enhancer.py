@@ -1,4 +1,4 @@
-# Import statements
+# Import required libraries
 import gdown
 import streamlit as st
 import torch
@@ -9,172 +9,150 @@ import cv2
 import numpy as np
 import io
 import os
+import sys
 
-# Set page config (must be the first Streamlit command)
+# Set Streamlit page configuration
 st.set_page_config(page_title="AI Photo Enhancer", layout="wide")
 
-# Import RRDBNet architecture
-from RRDBNet_arch import RRDBNet
+# Prevent Streamlit file watcher error with PyTorch
+if 'torch.classes' in sys.modules:
+    del sys.modules['torch.classes']
 
-# Ensure model directory exists
-os.makedirs("models", exist_ok=True)
+# ✅ **Download ESRGAN Model from Google Drive**
+MODEL_PATH = "models/RRDB_ESRGAN_x4.pth"
+MODEL_URL = "https://drive.google.com/file/d/1M_4u0EEq1ZUeHhrudY8P_P_08F8utv5f/view?usp=drive_link"  # 
 
-# Google Drive model link
-MODEL_URL = "https://drive.google.com/uc?id=1M_4u0EEq1ZUeHhrudY8P_P_08F8utv5f"  # Modify with correct ID
+if not os.path.exists(MODEL_PATH):
+    st.warning("Downloading ESRGAN model (This happens only once)...")
+    gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
 
-# Function to download model
-@st.cache_resource
-def download_model():
-    model_path = "models/RRDB_ESRGAN_x4.pth"
-    if not os.path.exists(model_path):
-        st.info("Downloading ESRGAN model...")
-        gdown.download(MODEL_URL, model_path, quiet=False)
-    return model_path
+# ✅ **Define ESRGAN Model Architecture**
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, nf=32, gc=16, bias=True):  # ✅ Reduced channels for speed
+        super(ResidualDenseBlock, self).__init__()
+        self.conv1 = nn.Conv2d(nf, gc, 3, padding=1, bias=bias)
+        self.conv2 = nn.Conv2d(nf + gc, gc, 3, padding=1, bias=bias)
+        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, padding=1, bias=bias)
+        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, padding=1, bias=bias)
+        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, padding=1, bias=bias)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-# Function to load ESRGAN model
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x
+
+class RRDB(nn.Module):
+    def __init__(self, nf, gc=16):  # ✅ Reduced GC
+        super(RRDB, self).__init__()
+        self.RDB1 = ResidualDenseBlock(nf, gc)
+        self.RDB2 = ResidualDenseBlock(nf, gc)
+        self.RDB3 = ResidualDenseBlock(nf, gc)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return out * 0.2 + x
+
+class RRDBNet(nn.Module):
+    def __init__(self, in_nc=3, out_nc=3, nf=32, nb=10, gc=16):  # ✅ Optimized model
+        super(RRDBNet, self).__init__()
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, padding=1, bias=True)
+        self.RRDB_trunk = nn.Sequential(*[RRDB(nf, gc) for _ in range(nb)])
+        self.trunk_conv = nn.Conv2d(nf, nf, 3, padding=1, bias=True)
+        self.upconv1 = nn.Conv2d(nf, nf, 3, padding=1, bias=True)
+        self.upconv2 = nn.Conv2d(nf, nf, 3, padding=1, bias=True)
+        self.HRconv = nn.Conv2d(nf, nf, 3, padding=1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, padding=1, bias=True)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+    def forward(self, x):
+        fea = self.conv_first(x)
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))
+        fea = fea + trunk
+        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))
+        return out
+
+# ✅ **Load AI Model**
 @st.cache_resource
 def load_model():
-    model_path = download_model()
-    model = RRDBNet(in_nc=3, out_nc=3, nf=32, nb=10, gc=16)
-    model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=True)
+    model = RRDBNet()
+    model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'), strict=True)
     model.eval()
     return model
 
-# Load model
-try:
-    model = load_model()
-except Exception as e:
-    st.error(f"Error loading the model: {e}")
-    st.warning("Super-resolution disabled.")
-    model = None
+model = load_model()
 
-# Function to check image size
-def check_image_size(image):
-    """Check if image is too large to process"""
-    width, height = image.size
-    pixels = width * height
-    if pixels > 4000 * 3000:  # 12MP limit
-        return False
-    return True
-
-# Function to enhance image
+# ✅ **Image Enhancement Function**
 def enhance_image(image, contrast=1.5, sharpness=2.0, brightness=1.2, super_res=False):
-    """Enhance image using contrast, sharpness, and optionally super-resolution"""
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    # Convert image to OpenCV format
-    status_text.text("Applying contrast enhancement...")
+
+    status_text.text("Applying enhancements...")
     img = np.array(image.convert("RGB"))
-    
-    # Contrast enhancement using CLAHE
+
+    # Contrast Enhancement
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=contrast, tileGridSize=(8, 8))
     l = clahe.apply(l)
     enhanced_img = cv2.merge((l, a, b))
     enhanced_img = cv2.cvtColor(enhanced_img, cv2.COLOR_LAB2RGB)
-    progress_bar.progress(30)
 
-    # Convert to PIL Image for sharpness & brightness enhancement
-    status_text.text("Adjusting sharpness and brightness...")
+    # Convert to PIL Image
     enhanced_img = Image.fromarray(enhanced_img)
     enhanced_img = ImageEnhance.Sharpness(enhanced_img).enhance(sharpness)
     enhanced_img = ImageEnhance.Brightness(enhanced_img).enhance(brightness)
+
     progress_bar.progress(60)
 
-    # Apply Super-Resolution if selected
-    if super_res and model is not None:
-        status_text.text("Applying AI Super-Resolution (this may take a while)...")
+    if super_res:
+        status_text.text("Applying AI Super-Resolution...")
         enhanced_img = apply_super_resolution(enhanced_img)
-    
+
     progress_bar.progress(100)
     status_text.text("Enhancement complete!")
     return enhanced_img
 
-# Function to apply AI Super-Resolution
-def apply_super_resolution(image, tile_size=256):
-    """Apply AI Super-Resolution using Tiling to Prevent Crashes"""
-    img = np.array(image.convert("RGB")) / 255.0  # Normalize
-    h, w, _ = img.shape
+# ✅ **Apply Super-Resolution**
+def apply_super_resolution(image):
+    img_tensor = torch.from_numpy(np.array(image).transpose((2, 0, 1))).float().unsqueeze(0) / 255.0
+    with torch.no_grad():
+        output = model(img_tensor)
+    output_image = output.squeeze().cpu().numpy().transpose((1, 2, 0))
+    output_image = np.clip(output_image * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(output_image)
 
-    # Create output image placeholder
-    output_img = np.zeros((h * 4, w * 4, 3), dtype=np.float32)
-
-    # Process the image tile-by-tile
-    for y in range(0, h, tile_size):
-        for x in range(0, w, tile_size):
-            tile = img[y:y+tile_size, x:x+tile_size, :]
-            tile = torch.from_numpy(tile.transpose((2, 0, 1))).float().unsqueeze(0)
-
-            # Apply the ESRGAN model
-            with torch.no_grad():
-                out_tile = model(tile).squeeze().cpu().numpy().transpose((1, 2, 0))
-
-            # Store the processed tile in the output image
-            output_img[y*4:(y+tile_size)*4, x*4:(x+tile_size)*4, :] = out_tile
-
-    # Convert back to an image
-    output_img = np.clip(output_img * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(output_img)
-
-# Function to convert PIL Image to bytes
-def pil_to_bytes(image):
-    """Convert PIL Image to byte format"""
-    img_byte_arr = io.BytesIO()
-    image.save(img_byte_arr, format='JPEG', quality=95)
-    return img_byte_arr.getvalue()
-
-# Streamlit UI
+# ✅ **Streamlit UI**
 st.title("📸 AI-Powered Photo Enhancer")
-st.write("Enhance your photos using AI Super-Resolution and OpenCV!")
+st.write("Enhance your photos using AI-powered super-resolution and image processing.")
 
-# File uploader
 uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
-    # Load and display original image
     image = Image.open(uploaded_file)
-    
-    # Check image size
-    if not check_image_size(image):
-        st.warning("Image is too large. Please upload a smaller image (max 4000x3000 pixels).")
-        st.stop()
-    
-    # Create two columns for before/after comparison
+
     col1, col2 = st.columns(2)
-    
     with col1:
         st.subheader("Original Image")
         st.image(image, use_container_width=True)
 
-    # Enhancement options
     st.sidebar.subheader("Enhancement Settings")
     contrast = st.sidebar.slider("Contrast", 1.0, 3.0, 1.5)
     sharpness = st.sidebar.slider("Sharpness", 1.0, 5.0, 2.0)
     brightness = st.sidebar.slider("Brightness", 0.5, 2.0, 1.2)
     super_res = st.sidebar.checkbox("Apply AI Super-Resolution", disabled=model is None)
-    
-    if model is None and super_res:
-        st.sidebar.warning("Super-resolution model not loaded. Check model path.")
 
-    # Enhance Image
     if st.sidebar.button("Enhance Image"):
         with col2:
-            st.subheader("Enhanced Image")
             enhanced_image = enhance_image(image, contrast, sharpness, brightness, super_res)
             st.image(enhanced_image, use_container_width=True)
-            
-            # Download button
-            img_byte_arr = pil_to_bytes(enhanced_image)
-            st.download_button(
-                "Download Enhanced Image",
-                img_byte_arr,
-                "enhanced_image.jpg",
-                "image/jpeg",
-                use_container_width=True
-            )
+            st.download_button("Download Enhanced Image", io.BytesIO(), "enhanced_image.jpg", "image/jpeg")
 
-# Footer
-st.markdown("---")
-st.markdown("Made with ❤️ by Saurabh using Streamlit, PyTorch, and OpenCV")
+st.markdown("---\nMade with ❤️ using Streamlit, PyTorch, and OpenCV")
