@@ -1,4 +1,5 @@
 # Import statements
+import gdown
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -22,6 +23,17 @@ st.set_page_config(page_title="AI Photo Enhancer", layout="wide")
 # Prevent Streamlit file watcher error with PyTorch
 if 'torch.classes' in sys.modules:
     del sys.modules['torch.classes']
+
+# Google Drive model download function
+def download_model_from_drive():
+    file_id = "1M_4u0EEq1ZUeHhrudY8P_P_08F8utv5f"  # Replace with your actual Google Drive file ID
+    destination = "models/RRDB_ESRGAN_x4.pth"
+    if not os.path.exists(destination):  # Check if model already exists
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, destination, quiet=False)
+
+# Download model if not exists
+download_model_from_drive()
 
 # Load ESRGAN model with caching
 @st.cache_resource
