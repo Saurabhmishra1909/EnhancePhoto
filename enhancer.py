@@ -37,7 +37,7 @@ if not os.path.exists(MODEL_PATH):
 def load_model():
     try:
         model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32)  # Match ESRGAN architecture
-        model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'), strict=False)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location='gpu'), strict=False)
         model.eval()
         return model
     except Exception as e:
@@ -110,7 +110,7 @@ def apply_super_resolution(image):
             output = output[:, :, :h*4, :w*4]
 
         # Convert back to image format
-        output_image = output.squeeze().cpu().numpy().transpose((1, 2, 0))
+        output_image = output.squeeze().gpu().numpy().transpose((1, 2, 0))
         output_image = np.clip(output_image * 255.0, 0, 255).astype(np.uint8)
 
         return Image.fromarray(output_image)
